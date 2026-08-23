@@ -362,7 +362,42 @@ pub fn run_reporting(args: SyncArgs) -> Result<Vec<crate::resolve::MissingDep>> 
     if may_refresh_platforms(&file_oses, &covered_oses) {
         for d in decls.iter_mut() {
             let on = oses.get(&d.subrepo()).cloned().unwrap_or_default();
-            d.platforms = if on == covered_oses { None } else { Some(on) };
+            let computed = if on == covered_oses { None } else { Some(on) };
+            if computed == d.platforms {
+                continue;
+            }
+            if keeps_narrowed_root_gate(d.root, &d.platforms, &computed) {
+                eprintln!(
+                    "sync: keeping platforms = {:?} on {}: it is declared a root, so \
+                     resolution reaches it everywhere by definition and has nothing to \
+                     say about the recorded narrowing. If nothing in this repo imports \
+                     it, the real fix is demoting it (indirect = True); if it truly \
+                     builds everywhere now, delete the platforms attribute by hand.",
+                    d.platforms
+                        .as_ref()
+                        .unwrap()
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    d.subrepo(),
+                );
+                continue;
+            }
+            // Every other platforms rewrite is legitimate but must never be
+            // silent: a changed gate changes what `plz build //...` even
+            // attempts, on machines that are not this one.
+            let show = |p: &Option<BTreeSet<String>>| match p {
+                None => "everywhere".to_string(),
+                Some(s) if s.is_empty() => "nowhere covered".to_string(),
+                Some(s) => s.iter().cloned().collect::<Vec<_>>().join(", "),
+            };
+            eprintln!(
+                "sync: platforms for {}: {} -> {}",
+                d.subrepo(),
+                show(&d.platforms),
+                show(&computed),
+            );
+            d.platforms = computed;
         }
     } else {
         let unseen: Vec<&str> = file_oses
@@ -476,6 +511,24 @@ pub fn run_reporting(args: SyncArgs) -> Result<Vec<crate::resolve::MissingDep>> 
         lock.crates.len(),
     );
     Ok(missing_deps)
+}
+
+/// Whether a recorded `platforms` narrowing on a ROOT declaration outranks
+/// the resolver's answer.
+///
+/// A root resolves on every triple BY CONSTRUCTION, so "reachable
+/// everywhere" (computed = None) carries no information about it -- while a
+/// hand-narrowed `platforms` on that same root records something the
+/// resolver cannot know, usually that the crate does not compile elsewhere.
+/// Overwriting the narrow value with the tautology is how a repo loses the
+/// same gate on every sync until a broken build surfaces it (measured three
+/// times in one repo before this function existed).
+fn keeps_narrowed_root_gate(
+    root: bool,
+    recorded: &Option<BTreeSet<String>>,
+    computed: &Option<BTreeSet<String>>,
+) -> bool {
+    root && computed.is_none() && recorded.is_some()
 }
 
 /// Whether this run is entitled to rewrite the recorded platforms.
@@ -2961,6 +3014,35 @@ rust_resolve(
         );
         // A file that names no platforms constrains nothing.
         assert!(may_refresh_platforms(&BTreeSet::new(), &BTreeSet::new()));
+    }
+
+    /// A hand-narrowed gate on a ROOT is human knowledge the resolver does
+    /// not have -- a root is reachable everywhere by definition, so
+    /// "computed: everywhere" restates the root flag rather than the world.
+    /// This is the exact shape that ate system-configuration's macos gate
+    /// three syncs running in tfw.computer: a crate spuriously marked root,
+    /// hand-gated to macos because it does not compile elsewhere, un-gated
+    /// again by every sync until the next `plz build //...` on linux broke.
+    #[test]
+    fn a_narrowed_gate_on_a_root_survives_the_everywhere_tautology() {
+        let macos: Option<BTreeSet<String>> = Some(["macos".to_string()].into_iter().collect());
+        let linux: Option<BTreeSet<String>> = Some(["linux".to_string()].into_iter().collect());
+
+        // The bite: root, recorded macos, computed everywhere -- keep.
+        assert!(keeps_narrowed_root_gate(true, &macos, &None));
+
+        // A non-root computed everywhere genuinely is everywhere: a new
+        // dependency edge can make a once-gated crate needed on every
+        // platform, and the refresh must be allowed to say so.
+        assert!(!keeps_narrowed_root_gate(false, &macos, &None));
+
+        // A root whose computed set is NARROWER than everything carries
+        // real information (some covered triple failed to reach it), so
+        // the resolver's answer stands.
+        assert!(!keeps_narrowed_root_gate(true, &macos, &linux));
+
+        // Nothing recorded means nothing to protect.
+        assert!(!keeps_narrowed_root_gate(true, &None, &None));
     }
 
     #[test]
