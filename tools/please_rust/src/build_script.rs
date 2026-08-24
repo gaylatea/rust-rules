@@ -369,7 +369,17 @@ fn build_environment(
     // Hermetic C toolchain for cc-crate build scripts
     if let Some((cc, cxx, ar, ranlib)) = resolve_cc(&args.cc) {
         env.insert("CC".to_string(), cc);
-        env.insert("CXX".to_string(), cxx);
+        // No C++ compiler in the configured toolchain: point CXX at a
+        // stand-in that explains itself, rather than at the host's compiler
+        // (a silent ABI mismatch) or at nothing (cc-rs would then find the
+        // host's c++ on PATH by itself, which is the same mismatch).
+        let cxx = match cxx {
+            Some(cxx) => Some(cxx),
+            None => write_cxx_stand_in(out_dir),
+        };
+        if let Some(cxx) = cxx {
+            env.insert("CXX".to_string(), cxx);
+        }
         env.insert("AR".to_string(), ar);
         env.insert("RANLIB".to_string(), ranlib);
     }
@@ -748,47 +758,147 @@ pub fn read_dep_metadata(path: &Path) -> Result<Vec<(String, String)>> {
     })
 }
 
+/// Stands in for CXX when an explicitly-pathed CCTool ships no C++ compiler.
+///
+/// A REAL EXECUTABLE, written next to the build script's out dir, and a
+/// single path with no arguments. cc-rs splits CXX on whitespace and
+/// Command::new()s the first token -- it never goes through a shell -- so a
+/// shell snippet here would be spawned as a binary literally named
+/// "please_rust_no_cxx()" and fail with "No such file or directory", which
+/// explains nothing. Verified against cc-1.2.0's parse_tool_and_wrapper.
+///
+/// A crate that never compiles C++ never runs it and builds exactly as
+/// before; one that does gets the reason at the moment it needs the tool,
+/// naming the configuration rather than the crate. Pointing CXX at the host
+/// instead is what produces an unreadable link failure thousands of symbols
+/// later.
+const CXX_ABSENT_MESSAGE: &str = "\
+please_rust: this crate compiles C++, but the configured CCTool ships no C++ compiler beside it.
+please_rust: the host C++ compiler is deliberately NOT used as a fallback -- it would not share
+please_rust: CCTool's C++ standard library, and the two only disagree at the final link, as
+please_rust: undefined std::__cxx11:: symbols blamed on whichever crate compiled C++.
+please_rust: ship a C++ compiler beside the C one (gcc/g++, clang/clang++, else c++), or set
+please_rust: CCTool to a bare command name to use the host toolchain deliberately.";
+
+/// Writes the stand-in and returns its path, or None if it cannot be written
+/// (in which case the caller leaves CXX unset rather than failing here).
+pub fn write_cxx_stand_in(dir: &Path) -> Option<String> {
+    let path = dir.join("please_rust_no_cxx");
+    let script = format!(
+        "#!/bin/sh\ncat >&2 <<'PLEASE_RUST_EOF'\n{CXX_ABSENT_MESSAGE}\nPLEASE_RUST_EOF\nexit 1\n"
+    );
+    fs::write(&path, script).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).ok()?;
+    }
+    Some(path.display().to_string())
+}
+
+/// The C++ compiler names that conventionally sit beside a given C compiler.
+///
+/// The pairing is by convention and it is not one name: gcc ships g++, clang
+/// ships clang++, a toolchain directory usually offers a plain c++. Looking
+/// only for "c++" finds none of the first two, which is how a hermetic gcc
+/// silently ended up paired with the host's C++ compiler.
+fn cxx_names_for(cc_name: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    // gcc -> g++, clang -> clang++, cc -> c++: strip a trailing "cc" and add
+    // "++" to what is left, which is the rule all three follow.
+    if let Some(stem) = cc_name.strip_suffix("cc") {
+        names.push(format!("{stem}++"));
+    }
+    // clang -> clang++, and any driver that just takes a ++ suffix.
+    names.push(format!("{cc_name}++"));
+    // The generic name, last: a directory of wrappers usually has one, but a
+    // more specific match beside the actual cc is the better answer.
+    names.push("c++".to_string());
+    names.dedup();
+    names
+}
+
 /// Resolve a C toolchain path (cc binary or directory of wrappers) to
 /// absolute cc/c++/ar/ranlib paths.
-pub fn resolve_cc(cc: &Option<PathBuf>) -> Option<(String, String, String, String)> {
+///
+/// WHY CXX IS NOT ALLOWED TO FALL BACK TO THE HOST, while ar and ranlib are.
+/// CC and CXX have to agree on a C++ standard library, because their objects
+/// meet in one link. Mixing them does not fail where the mistake was made: a
+/// host g++ emits references to libstdc++'s std::__cxx11::basic_string, a
+/// musl/libc++ link defines no such symbol, and the build dies thousands of
+/// undefined symbols later pointing at the innocent crate's own headers.
+/// (Measured against duckdb: ~60000 of them, and it reads as a broken duckdb
+/// rather than as two C++ standard libraries in one binary.)
+///
+/// ar and ranlib are genuinely different and keep the host fallback: an
+/// archive is an ABI-neutral container of objects, and the host archiver
+/// packs objects it never has to understand.
+///
+/// A `None` cxx means "this toolchain has no C++ compiler", which is not an
+/// error on its own -- see write_cxx_stand_in().
+pub fn resolve_cc(cc: &Option<PathBuf>) -> Option<(String, Option<String>, String, String)> {
     let cc = cc.as_ref()?;
     let abs = match cc.canonicalize() {
         Ok(p) => p,
-        // A bare command name (e.g. "cc"): pass through for PATH resolution
+        // A bare command name (e.g. "cc"): pass through for PATH resolution.
+        // This is the documented host convention, so a host C++ beside it is
+        // the intended answer rather than an accident -- both come from the
+        // same PATH and therefore agree.
         Err(_) => {
             let name = cc.display().to_string();
-            return Some((
-                name,
-                "c++".to_string(),
-                "ar".to_string(),
-                "ranlib".to_string(),
-            ));
+            let cxx = cxx_names_for(&name)
+                .into_iter()
+                .find(|n| which_on_path(n).is_some())
+                .unwrap_or_else(|| "c++".to_string());
+            return Some((name, Some(cxx), "ar".to_string(), "ranlib".to_string()));
         }
     };
-    if abs.is_dir() {
-        Some((
-            abs.join("cc").display().to_string(),
-            abs.join("c++").display().to_string(),
-            abs.join("ar").display().to_string(),
-            abs.join("ranlib").display().to_string(),
-        ))
+    let (dir, cc_name) = if abs.is_dir() {
+        (abs.clone(), "cc".to_string())
     } else {
-        let dir = abs.parent()?;
-        let sibling = |n: &str, fallback: &str| {
-            let p = dir.join(n);
-            if p.exists() {
-                p.display().to_string()
-            } else {
-                fallback.to_string()
-            }
-        };
-        Some((
-            abs.display().to_string(),
-            sibling("c++", "c++"),
-            sibling("ar", "ar"),
-            sibling("ranlib", "ranlib"),
-        ))
-    }
+        (
+            abs.parent()?.to_path_buf(),
+            abs.file_name()?.to_string_lossy().into_owned(),
+        )
+    };
+    let cc_path = if abs.is_dir() {
+        dir.join("cc").display().to_string()
+    } else {
+        abs.display().to_string()
+    };
+    let sibling = |n: &str, fallback: &str| {
+        let p = dir.join(n);
+        if p.exists() {
+            p.display().to_string()
+        } else {
+            fallback.to_string()
+        }
+    };
+    // An explicit path is a deliberate request for THIS toolchain, so a C++
+    // compiler that is not part of it is not an answer. When there is none,
+    // CXX is reported ABSENT rather than pointed at the host: a crate that
+    // never compiles C++ (most of them) must keep working, and only one that
+    // does should fail. See write_cxx_stand_in().
+    let cxx = cxx_names_for(&cc_name)
+        .into_iter()
+        .map(|n| dir.join(n))
+        .find(|p| p.exists())
+        .map(|p| p.display().to_string());
+    Some((
+        cc_path,
+        cxx,
+        sibling("ar", "ar"),
+        sibling("ranlib", "ranlib"),
+    ))
+}
+
+/// Whether a bare command name resolves on PATH.
+fn which_on_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os("PATH").and_then(|paths| {
+        std::env::split_paths(&paths)
+            .map(|d| d.join(name))
+            .find(|p| p.is_file())
+    })
 }
 
 /// Recursively search for a file with the given name in the directory tree
@@ -894,7 +1004,7 @@ mod tests {
         // Bare command name passes through
         let (cc, cxx, ar, _) = resolve_cc(&Some(PathBuf::from("cc"))).unwrap();
         assert_eq!(cc, "cc");
-        assert_eq!(cxx, "c++");
+        assert_eq!(cxx.as_deref(), Some("c++"));
         assert_eq!(ar, "ar");
 
         // Directory of wrappers
@@ -908,6 +1018,131 @@ mod tests {
         assert!(ar.ends_with("/ar"));
 
         assert!(resolve_cc(&None).is_none());
+    }
+
+    /// A unique scratch directory per test, so these can run concurrently.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "please_rust_cxx_{}_{}_{:?}",
+            tag,
+            std::process::id(),
+            std::thread::current().id(),
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// gcc ships g++, not c++. Looking only for "c++" is what silently paired
+    /// a hermetic gcc with the HOST's C++ compiler.
+    #[test]
+    fn a_cxx_is_found_under_its_conventional_name() {
+        for (cc_name, cxx_name) in [("gcc", "g++"), ("clang", "clang++"), ("cc", "c++")] {
+            let dir = scratch(cc_name);
+            fs::write(dir.join(cc_name), "").unwrap();
+            fs::write(dir.join(cxx_name), "").unwrap();
+
+            let (_, cxx, _, _) = resolve_cc(&Some(dir.join(cc_name))).unwrap();
+            assert_eq!(
+                cxx.as_deref(),
+                Some(dir.join(cxx_name).display().to_string().as_str()),
+                "{cc_name} should pair with the {cxx_name} beside it"
+            );
+        }
+    }
+
+    /// The specific name beside the compiler beats the generic one, so a
+    /// toolchain shipping both g++ and a c++ shim gets its own.
+    #[test]
+    fn the_toolchains_own_cxx_wins_over_the_generic_name() {
+        let dir = scratch("both");
+        fs::write(dir.join("gcc"), "").unwrap();
+        fs::write(dir.join("g++"), "").unwrap();
+        fs::write(dir.join("c++"), "").unwrap();
+
+        let (_, cxx, _, _) = resolve_cc(&Some(dir.join("gcc"))).unwrap();
+        assert_eq!(
+            cxx.as_deref(),
+            Some(dir.join("g++").display().to_string().as_str())
+        );
+    }
+
+    /// THE BUG THIS FIXES. An explicitly-pathed CCTool with no C++ compiler
+    /// beside it must NOT resolve to the host's: they would not share a C++
+    /// standard library, and the mismatch only surfaces at the final link.
+    #[test]
+    fn an_explicit_cc_without_a_cxx_never_falls_back_to_the_host() {
+        let dir = scratch("nocxx");
+        fs::write(dir.join("zcc"), "").unwrap();
+
+        let (cc, cxx, _, _) = resolve_cc(&Some(dir.join("zcc"))).unwrap();
+        assert!(cc.ends_with("/zcc"), "the C compiler is still resolved");
+        assert_eq!(cxx, None, "CXX must be absent, not the host's: {cxx:?}");
+    }
+
+    /// ar and ranlib are ABI-neutral, so the host fallback stays for them --
+    /// otherwise a C-only toolchain would need to ship an archiver it has no
+    /// reason to.
+    #[test]
+    fn ar_and_ranlib_still_fall_back_to_the_host() {
+        let dir = scratch("noar");
+        fs::write(dir.join("cc"), "").unwrap();
+        fs::write(dir.join("c++"), "").unwrap();
+
+        let (_, _, ar, ranlib) = resolve_cc(&Some(dir.join("cc"))).unwrap();
+        assert_eq!(ar, "ar");
+        assert_eq!(ranlib, "ranlib");
+    }
+
+    /// The stand-in has to FAIL when run, and say why.
+    ///
+    /// Spawned THE WAY CC-RS DOES -- split on whitespace, Command::new() the
+    /// first token, no shell. An earlier version of this was a shell snippet
+    /// and this test ran it through `sh -c`, which passed while the real
+    /// thing died as "No such file or directory" on a binary named
+    /// "please_rust_no_cxx()". Testing it through a shell tests the shell.
+    #[test]
+    fn the_absent_cxx_stand_in_fails_with_an_explanation() {
+        let dir = scratch("standin");
+        let cxx = write_cxx_stand_in(&dir).expect("write the stand-in");
+
+        let mut parts = cxx.split_whitespace();
+        let bin = parts.next().expect("a first token");
+        assert_eq!(parts.next(), None, "CXX must be ONE token, got {cxx:?}");
+
+        let out = std::process::Command::new(bin)
+            .args(["-c", "foo.cpp"])
+            .output()
+            .expect("cc-rs spawns CXX directly, so this must be executable");
+
+        assert!(!out.status.success(), "it must fail rather than no-op");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("CCTool"), "names the setting: {err}");
+        assert!(err.contains("C++ compiler"), "says what is missing: {err}");
+    }
+
+    /// The build script env gets a CXX that is a real, runnable program even
+    /// when the toolchain has none -- never the host's, and never unset (an
+    /// unset CXX sends cc-rs to PATH, which is the same mismatch).
+    #[test]
+    fn a_toolchain_without_a_cxx_still_exports_a_runnable_one() {
+        let dir = scratch("env");
+        fs::write(dir.join("zcc"), "").unwrap();
+        let out_dir = dir.join("out");
+        fs::create_dir_all(&out_dir).unwrap();
+
+        let (_, cxx, _, _) = resolve_cc(&Some(dir.join("zcc"))).unwrap();
+        assert_eq!(cxx, None);
+        let cxx = write_cxx_stand_in(&out_dir).expect("a stand-in is written");
+
+        assert!(
+            Path::new(&cxx).is_file(),
+            "CXX must name a real file, got {cxx}"
+        );
+        let status = std::process::Command::new(&cxx)
+            .status()
+            .expect("and it must be executable");
+        assert!(!status.success());
     }
 }
 

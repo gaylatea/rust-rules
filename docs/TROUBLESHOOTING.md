@@ -175,6 +175,28 @@ plugin. Point `CCTool` at a build label to use something else. For crates
 whose build scripts publish link metadata, `links` and
 `DEP_<LINKS>_<KEY>` propagation is wired; see `test/links`.
 
+`CXX`, `AR` and `RANLIB` are derived from `CCTool` rather than configured
+separately. `CXX` is looked up beside the C compiler under the name its
+toolchain conventionally uses -- `gcc` pairs with `g++`, `clang` with
+`clang++`, anything else with `c++`.
+
+## `this crate compiles C++, but the configured CCTool ships no C++ compiler`
+
+`CCTool` names a compiler by path, a crate in the build compiles C++, and no
+C++ compiler sits next to the C one. The host's is deliberately **not** used
+to fill the gap.
+
+That is not pedantry. `CC` and `CXX` have to agree on a C++ standard library
+because their objects meet in a single link, and a host `g++` paired with a
+hermetic `cc` does not fail at the point of the mistake -- it fails at the
+final link, as thousands of undefined `std::__cxx11::` symbols attributed to
+whichever crate happened to compile C++. The namespace is the tell:
+`std::__cxx11::` is GNU libstdc++, `std::__1::` is libc++.
+
+Either ship a C++ compiler beside the C one under a name above, or set
+`CCTool` to a bare command name to use the host toolchain deliberately -- in
+that case `CXX` also comes from `PATH`, so the two agree.
+
 ## A cold checkout downloads a Rust toolchain during `plz query`
 
 Parsing a package that references a crate subrepo has to build that subrepo,

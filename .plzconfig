@@ -80,7 +80,7 @@ Inherit = true
 ConfigKey = CCTool
 DefaultValue = 
 Optional = true
-Help = Optional build label of a C compiler used by crate build scripts and as rustc's linker (the go-rules CC_TOOL pattern). Empty uses the host cc via PATH, matching the cc plugin's default.
+Help = Optional build label of a C compiler used by crate build scripts and as rustc's linker (the go-rules CC_TOOL pattern). CXX, AR and RANLIB are found beside it (gcc/g++, clang/clang++, else c++); a path with no C++ compiler beside it leaves CXX unset rather than using the host's, which would not share its C++ standard library. Empty uses the host cc via PATH, matching the cc plugin's default.
 Inherit = true
 
 [PluginConfig "default_static"]

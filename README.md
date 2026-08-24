@@ -401,6 +401,16 @@ plugin's default.
 CCTool = //third_party/cc:toolchain
 ```
 
+`CXX`, `AR` and `RANLIB` come from here too, found beside the C compiler --
+`gcc` pairs with `g++`, `clang` with `clang++`, anything else with `c++`.
+
+When `CCTool` is a path and no C++ compiler sits beside it, `CXX` is left
+unset rather than pointed at the host's: the two would not share a C++
+standard library, and they would only disagree at the final link. Crates
+that compile no C++ are unaffected; one that does fails saying so. A bare
+command name keeps the host convention for `CXX` as well, since both then
+come from the same `PATH`.
+
 ### Tool overrides
 The other tools the rules drive each take a build label. Every one defaults
 to the toolchain you already configured, so a normal repo sets none of them:
