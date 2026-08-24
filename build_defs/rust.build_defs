@@ -1589,9 +1589,22 @@ def rust_repo(
     target_triple = build_triple()
     # Cross-compiling: libraries are built for the target, while build scripts,
     # proc macros and installed binaries run during the build and stay on the
-    # host. Without --arch there is nothing to say.
+    # host.
+    #
+    # COMPARING TRIPLES, NOT os_arch PAIRS, for the reason target_flag() gives
+    # for first-party crates: `TargetTriple` carries a libc dimension Please's
+    # pair cannot express, so x86_64-unknown-linux-musl on a gnu host is the
+    # SAME os_arch and still a genuine cross-compile. Deciding on the pair
+    # skipped --compile-target there, which left the generated crate BUILD
+    # asymmetric -- the build-script rule got `--target` (it reads
+    # `build_triple()` directly) while the crate's own compile rule got none,
+    # so rustc fell back to the host and every third-party crate came back
+    # gnu. First-party crates asked for musl and then could not find them:
+    # "couldn't find crate anyhow with expected target triple
+    # x86_64-unknown-linux-musl". This is the same comparison target_flag()
+    # has always made; the two paths simply disagreed.
     cross_flag = ""
-    if CONFIG.TARGET_OS != CONFIG.HOSTOS or CONFIG.TARGET_ARCH != CONFIG.HOSTARCH:
+    if target_triple != host_triple():
         cross_flag = f"--compile-target {target_triple} "
     pipeline_flag = "--pipeline " if CONFIG.RUST.PIPELINED_COMPILATION else ""
     # Only baked in when somebody picked a number. Left alone the generated
