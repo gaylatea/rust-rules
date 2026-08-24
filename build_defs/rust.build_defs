@@ -478,7 +478,17 @@ def _compile_cmds(crate_name:str, edition:str, crate_type:str, emit:str, feature
     manifest_arg = '--manifest-path $SRCS_MANIFEST ' if manifest else ''
     dep_args = ' '.join([f'--dep {d}' for d in _dep_names(deps)]) + ' ' if deps else ''
     links = crate_type in ['bin', 'proc-macro', 'dylib', 'cdylib', 'staticlib'] or test
-    cc_arg = '--cc $TOOLS_CC ' if links and CONFIG.RUST.CC_TOOL else ''
+    # A C toolchain is only wanted when this action actually LINKS. The crate
+    # type alone does not say that: rust_clippy compiles the very same
+    # crate_type (a `bin` stays a `bin`) but emits metadata only and never
+    # reaches a linker, so asking for one names a tool it has no reason to
+    # stage -- and `$TOOLS_CC` then expands to nothing:
+    #     bash: line 1: TOOLS_CC: unbound variable   (exit 127)
+    # Invisible until a CcTool is configured at all, which is why it survived
+    # this long. Every emit that genuinely links carries `link`, so that is
+    # the honest condition; splitting rather than substring-matching keeps a
+    # future 'dep-info,metadata' from reading as linking.
+    cc_arg = '--cc $TOOLS_CC ' if links and 'link' in emit.split(',') and CONFIG.RUST.CC_TOOL else ''
     static_arg = '--static ' if static else ''
     native_arg = '--native $SRCS_NATIVE ' if cc_deps else ''
     rmeta_arg = '--pipeline-rmeta ' if pipeline_rmeta else ''
